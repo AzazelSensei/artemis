@@ -67,8 +67,9 @@
     },
     "grok-cli": {
       "provider": "grok_cli",
-      "model": "grok-4.7-build",
-      "timeout": 180,
+      "model": "grok-4.7-build-fast",
+      "reasoning_effort": "low",
+      "timeout": 30,
       "fallback": { "provider": "claude_code", "model": "claude-haiku-5-5", "reasoning_effort": "medium" }
     }
   },

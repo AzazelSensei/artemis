@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
 import signal
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -56,9 +58,41 @@ _CODEX_DROPPED_KEYS = ("OPENAI_API_KEY", "CODEX_API_KEY")
 _CURSOR_DROPPED_KEYS = ("CURSOR_API_KEY",)
 _GROK_DROPPED_KEYS = ("XAI_API_KEY", "GROK_CODE_XAI_API_KEY")
 _CURSOR_PROGRAMS = ("cursor-agent",)
-_FORBIDDEN_ARGS = frozenset({"--bare", "--force", "-f", "--yolo", "--worktree", "-w"})
+_FORBIDDEN_ARGS = frozenset(
+    {"--bare", "--force", "-f", "--yolo", "--worktree", "-w", "--always-approve"}
+)
+_BYPASS_PERMISSIONS = "bypassPermissions"
 _END_OF_OPTIONS = "--"
 _GROK_PROMPT_NAME = "prompt.txt"
+_GROK_INTEGRATION_SOURCES = ("CLAUDE", "CURSOR")
+_GROK_INTEGRATION_FEATURES = ("AGENTS", "HOOKS", "MCPS", "RULES", "SKILLS")
+_GROK_QUIET_ENV = {
+    "GROK_MEMORY": "0",
+    "GROK_SUBAGENTS": "0",
+    "GROK_DISABLE_AUTOUPDATER": "1",
+    "GROK_MCP_STARTUP_TIMEOUT_SECS": "1",
+    "GROK_TELEMETRY_ENABLED": "false",
+    "GROK_FEEDBACK_ENABLED": "false",
+    "DISABLE_TELEMETRY": "1",
+    **{
+        f"GROK_{source}_{feature}_ENABLED": "false"
+        for source in _GROK_INTEGRATION_SOURCES
+        for feature in _GROK_INTEGRATION_FEATURES
+    },
+}
+_GROK_DEFAULT_MODEL = "grok-4.7-build-fast"
+_GROK_DEFAULT_EFFORT = "low"
+_GROK_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_GROK_JSON_IMAGE_TYPES = frozenset({"image/png", "image/jpeg"})
+_GROK_MAX_PROMPT_JSON_BYTES = 512 * 1024
+_LINUX_MAX_ARG_BYTES = 128 * 1024 - 1
+_LINUX_PLATFORM_PREFIX = "linux"
+_GROK_TOOL_ARGS = ("--tools", "read_file")
+_GROK_FIXED_ARGS = ("--no-subagents", "--no-plan", "--disable-web-search")
+_GROK_JSON_DISALLOWED_TOOLS = "read_file,search_tool,use_tool"
+_GROK_FILE_DISALLOWED_TOOLS = "search_tool,use_tool"
+_GROK_JSON_MAX_TURNS = "1"
+_GROK_FILE_MAX_TURNS = "3"
 _CLAUDE_SUCCESS_SUBTYPE = "success"
 _ERROR_SUBTYPE_PREFIX = "error"
 _CODEX_TOTAL_RE = re.compile(r"tokens used\s*:?\s*([\d.,]+)", re.IGNORECASE)
@@ -86,6 +120,8 @@ _CODEX_IO_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _HELP_CACHE: dict[tuple[str, ...], bool] = {}
+
+logger = logging.getLogger(__name__)
 
 
 def create_backend(provider: str) -> CliBackend:
@@ -226,17 +262,17 @@ class GrokBackend:
         workdir = _require_workdir(request.workdir)
         _require_timeout(request.timeout_seconds)
         binary = _resolve_bin(_GROK_BIN_ENV, "grok")
-        env = _env_without(_GROK_DROPPED_KEYS)
-        prompt = _prompt_with_workspace_images(request, include_schema=False)
-        prompt_path = workdir / _GROK_PROMPT_NAME
-        try:
-            prompt_path.write_text(prompt, encoding="utf-8")
-        except OSError as exc:
-            raise CliBackendError(f"failed to write {prompt_path.name}: {exc}") from exc
-        argv = [binary, "--prompt-file", str(prompt_path)]
-        model = _blank_to_none(request.model)
-        if model is not None:
-            argv.extend(["-m", model])
+        env = _quiet_env(_GROK_DROPPED_KEYS, _GROK_QUIET_ENV)
+        argv = [
+            binary,
+            *_grok_input_args(request, workdir),
+            "-m",
+            _blank_to_none(request.model) or _GROK_DEFAULT_MODEL,
+            "--effort",
+            _grok_effort(request.effort),
+            *_GROK_TOOL_ARGS,
+            *_GROK_FIXED_ARGS,
+        ]
         if request.json_schema is not None:
             argv.extend(["--json-schema", _dump_schema(request.json_schema)])
         else:
@@ -249,6 +285,86 @@ class GrokBackend:
             env=env,
         )
         return _json_cli_response(stdout)
+
+
+def _grok_input_args(request: CliRequest, workdir: Path) -> list[str]:
+    blocks = _grok_blocks(request)
+    if blocks is None:
+        logger.warning("grok image is not inline-encodable; falling back to prompt file")
+        return _grok_file_args(request, workdir)
+    prompt_json = json.dumps(blocks, ensure_ascii=False)
+    size = len(prompt_json.encode("utf-8")) + _schema_bytes(request.json_schema)
+    limit = _grok_prompt_json_limit()
+    if size <= limit:
+        return [
+            "--prompt-json",
+            prompt_json,
+            "--disallowed-tools",
+            _GROK_JSON_DISALLOWED_TOOLS,
+            "--max-turns",
+            _GROK_JSON_MAX_TURNS,
+        ]
+    logger.warning(
+        "grok prompt json is %d bytes (limit %d); falling back to prompt file",
+        size,
+        limit,
+    )
+    return _grok_file_args(request, workdir)
+
+
+def _grok_file_args(request: CliRequest, workdir: Path) -> list[str]:
+    prompt = _prompt_with_workspace_images(request, include_schema=False)
+    prompt_path = workdir / _GROK_PROMPT_NAME
+    try:
+        prompt_path.write_text(prompt, encoding="utf-8")
+    except OSError as exc:
+        raise CliBackendError(f"failed to write {prompt_path.name}: {exc}") from exc
+    return [
+        "--prompt-file",
+        str(prompt_path),
+        "--disallowed-tools",
+        _GROK_FILE_DISALLOWED_TOOLS,
+        "--max-turns",
+        _GROK_FILE_MAX_TURNS,
+    ]
+
+
+def _grok_prompt_json_limit() -> int:
+    if sys.platform.startswith(_LINUX_PLATFORM_PREFIX):
+        return min(_GROK_MAX_PROMPT_JSON_BYTES, _LINUX_MAX_ARG_BYTES)
+    return _GROK_MAX_PROMPT_JSON_BYTES
+
+
+def _schema_bytes(schema: dict[str, Any] | None) -> int:
+    if schema is None:
+        return 0
+    return len(_dump_schema(schema).encode("utf-8"))
+
+
+def _grok_blocks(request: CliRequest) -> list[dict[str, str]] | None:
+    blocks: list[dict[str, str]] = []
+    if request.system_prompt.strip():
+        blocks.append({"type": "text", "text": request.system_prompt})
+    for segment in request.segments:
+        if isinstance(segment, TextSegment):
+            blocks.append({"type": "text", "text": segment.text})
+            continue
+        if isinstance(segment, ImageSegment):
+            if not segment.base64_data or segment.media_type not in _GROK_JSON_IMAGE_TYPES:
+                return None
+            blocks.append(
+                {"type": "image", "data": segment.base64_data, "mimeType": segment.media_type}
+            )
+            continue
+        raise CliBackendError(f"unsupported segment: {type(segment).__name__}")
+    return blocks
+
+
+def _grok_effort(effort: str | None) -> str:
+    normalized = (_blank_to_none(effort) or "").lower()
+    if normalized in _GROK_EFFORTS:
+        return normalized
+    return _GROK_DEFAULT_EFFORT
 
 
 def _require_workdir(workdir: Path) -> Path:
@@ -319,12 +435,23 @@ def _env_without(keys: tuple[str, ...]) -> dict[str, str]:
 
 
 def _assert_argv_allowed(argv: list[str]) -> None:
+    previous: str | None = None
     for arg in argv:
         if arg == _END_OF_OPTIONS:
             return
-        flag = arg.split("=", 1)[0]
-        if flag in _FORBIDDEN_ARGS or flag.startswith(_FORBIDDEN_PREFIX):
-            raise CliBackendError(f"refusing forbidden flag: {arg}")
+        if _is_option_token(arg):
+            flag = arg.split("=", 1)[0]
+            if flag in _FORBIDDEN_ARGS or flag.startswith(_FORBIDDEN_PREFIX):
+                raise CliBackendError(f"refusing forbidden flag: {arg}")
+            if _BYPASS_PERMISSIONS in arg:
+                raise CliBackendError(f"refusing forbidden flag: {arg}")
+        elif arg == _BYPASS_PERMISSIONS and previous is not None and _is_option_token(previous):
+            raise CliBackendError(f"refusing forbidden flag value: {previous} {arg}")
+        previous = arg
+
+
+def _is_option_token(arg: str) -> bool:
+    return arg.startswith("-") and not any(char.isspace() for char in arg)
 
 
 def _dump_schema(schema: dict[str, Any]) -> str:
@@ -528,8 +655,12 @@ async def _kill_and_wait(process: asyncio.subprocess.Process) -> None:
 
 
 def _claude_env() -> dict[str, str]:
-    env = _env_without(_CLAUDE_DROPPED_KEYS)
-    for key, value in _CLAUDE_QUIET_ENV.items():
+    return _quiet_env(_CLAUDE_DROPPED_KEYS, _CLAUDE_QUIET_ENV)
+
+
+def _quiet_env(dropped_keys: tuple[str, ...], quiet: dict[str, str]) -> dict[str, str]:
+    env = _env_without(dropped_keys)
+    for key, value in quiet.items():
         env.setdefault(key, value)
     return env
 
