@@ -28,12 +28,15 @@ from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+DEFAULT_POLL_INTERVAL_SECONDS = 0.3
+MIN_POLL_INTERVAL_SECONDS = 0.05
+
 
 async def _poll_for_app_ready(
     ctx: ArtemisContext,
     app_package: str,
     max_poll_seconds: int = 15,
-    poll_interval: float = 1.0,
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> tuple[bool, str | None]:
     """Poll for app to be ready after launch.
 
@@ -44,38 +47,47 @@ async def _poll_for_app_ready(
         ctx: Mobile use context
         app_package: Expected package name
         max_poll_seconds: Maximum time to poll (default: 15s)
-        poll_interval: Time between polls (default: 1s)
+        poll_interval: Time between polls (default: 0.3s)
 
     Returns:
         Tuple of (success: bool, error_message: str | None)
     """
-    polls = int(max_poll_seconds / poll_interval)
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    deadline = started_at + max_poll_seconds
+    poll_number = 0
 
-    for i in range(polls):
+    while True:
+        poll_number += 1
         ready, current_package, task = await observe_foreground(ctx, app_package)
+        elapsed = loop.time() - started_at
 
         if ready:
             if current_package == app_package:
-                logger.success(f"App {app_package} is ready (took ~{i * poll_interval:.1f}s)")
+                logger.success(f"App {app_package} is ready (took ~{elapsed:.1f}s)")
             else:
                 logger.success(
                     f"App {app_package} is ready (focused window belongs to"
                     f" '{current_package}', but the foreground {task.describe()} is owned"
-                    f" by {app_package}, took ~{i * poll_interval:.1f}s)"
+                    f" by {app_package}, took ~{elapsed:.1f}s)"
                 )
             return True, None
 
         if current_package is None:
-            logger.debug(f"Poll {i + 1}/{polls}: App loading (mCurrentFocus=null)...")
+            logger.debug(
+                f"Poll {poll_number} ({elapsed:.1f}s): App loading (mCurrentFocus=null)..."
+            )
         else:
             logger.debug(
-                f"Poll {i + 1}/{polls}: Wrong app in foreground (expected"
+                f"Poll {poll_number} ({elapsed:.1f}s): Wrong app in foreground (expected"
                 f" '{app_package}', got '{current_package}', foreground"
                 f" {task.describe() if task else 'task unknown'}). Still waiting..."
             )
 
-        if i < polls - 1:
-            await asyncio.sleep(poll_interval)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(max(poll_interval, MIN_POLL_INTERVAL_SECONDS), remaining))
 
     current_package, task = await current_foreground(ctx)
     error_msg = (
