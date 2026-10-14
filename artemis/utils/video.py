@@ -40,7 +40,9 @@ ANDROID_RECORDING_SEGMENT_SECONDS = 1800
 # put the fallback near three quarters of a second after process creation.
 SCRCPY_RECORDING_STARTED_MARKER = "Recording started"
 SCRCPY_STARTUP_FALLBACK_SECONDS = 0.75
-SCRCPY_STARTUP_TIMEOUT_SECONDS = 6.0
+SCRCPY_STARTUP_TIMEOUT_SECONDS = 2.0
+STREAM_FORWARD_CHUNK_BYTES = 65536
+_STDERR_FORWARD_TASKS: set[asyncio.Task[None]] = set()
 # Ignore small timing differences at segment boundaries.
 TIMELINE_GAP_EPSILON_SECONDS = 0.05
 
@@ -64,6 +66,7 @@ def build_scrcpy_record_command(
         "--serial",
         device_id,
         "--no-window",
+        "--no-audio",
         "--record",
         str(output_path),
         "--record-format",
@@ -76,6 +79,44 @@ def build_scrcpy_record_command(
     return command
 
 
+async def _scan_for_recording_marker(
+    reader: asyncio.StreamReader, consumed: bytearray | None = None
+) -> bool:
+    while True:
+        line = await reader.readline()
+        if not line:
+            return False
+        if consumed is not None:
+            consumed.extend(line)
+        if SCRCPY_RECORDING_STARTED_MARKER in line.decode(errors="replace"):
+            return True
+
+
+async def _forward_stream(source: asyncio.StreamReader, target: asyncio.StreamReader) -> None:
+    try:
+        while chunk := await source.read(STREAM_FORWARD_CHUNK_BYTES):
+            target.feed_data(chunk)
+    except Exception as e:
+        target.set_exception(e)
+        return
+    target.feed_eof()
+
+
+def _restore_consumed_stderr(process: Any, consumed: bytearray) -> None:
+    if not consumed:
+        return
+    original = process.stderr
+    restored = asyncio.StreamReader()
+    restored.feed_data(bytes(consumed))
+    process.stderr = restored
+    if original.at_eof():
+        restored.feed_eof()
+        return
+    task = asyncio.create_task(_forward_stream(original, restored))
+    _STDERR_FORWARD_TASKS.add(task)
+    task.add_done_callback(_STDERR_FORWARD_TASKS.discard)
+
+
 async def await_scrcpy_first_frame(
     process: Any,
     spawned_at: float,
@@ -84,33 +125,46 @@ async def await_scrcpy_first_frame(
 ) -> float:
     """Estimate when the first frame of a scrcpy recording reached the host."""
     fallback = spawned_at + SCRCPY_STARTUP_FALLBACK_SECONDS
-    reader = getattr(process, "stdout", None)
-    if not isinstance(reader, asyncio.StreamReader):
+    stdout = getattr(process, "stdout", None)
+    stderr = getattr(process, "stderr", None)
+    consumed_stderr = bytearray()
+    scanners: set[asyncio.Task[bool]] = set()
+    if isinstance(stdout, asyncio.StreamReader):
+        scanners.add(asyncio.create_task(_scan_for_recording_marker(stdout)))
+    if isinstance(stderr, asyncio.StreamReader):
+        scanners.add(asyncio.create_task(_scan_for_recording_marker(stderr, consumed_stderr)))
+    if not scanners:
         await asyncio.sleep(0.8)
         return fallback
 
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            logger.warning(
-                f"scrcpy did not report '{SCRCPY_RECORDING_STARTED_MARKER}' within "
-                f"{timeout:.1f}s; assuming the first frame at spawn + "
-                f"{SCRCPY_STARTUP_FALLBACK_SECONDS:.2f}s"
+    pending = scanners
+    try:
+        deadline = time.monotonic() + timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"scrcpy did not report '{SCRCPY_RECORDING_STARTED_MARKER}' within "
+                    f"{timeout:.1f}s; assuming the first frame at spawn + "
+                    f"{SCRCPY_STARTUP_FALLBACK_SECONDS:.2f}s"
+                )
+                return fallback
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
             )
-            return fallback
+            if any(task.result() for task in done):
+                return max(spawned_at, time.time())
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout=remaining)
-        except TimeoutError:
-            continue
-        if not line:
-            try:
-                await asyncio.wait_for(process.wait(), timeout=1.0)
-            except (AttributeError, ProcessLookupError, TimeoutError):
-                pass
-            return fallback
-        if SCRCPY_RECORDING_STARTED_MARKER in line.decode(errors="replace"):
-            return max(spawned_at, time.time())
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+        except (AttributeError, ProcessLookupError, TimeoutError):
+            pass
+        return fallback
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        _restore_consumed_stderr(process, consumed_stderr)
 
 
 def is_ffmpeg_installed() -> bool:
