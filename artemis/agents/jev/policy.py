@@ -40,7 +40,7 @@ RISKY_LABEL_PATTERN = re.compile(
 )
 DUPLICATE_IOU_MIN = 0.7
 BOUNDS_LENGTH = 4
-DONE_MIN = 0.7
+DONE_DEFERRED_REASON = "DONE deferred to the model for a verified final report"
 
 
 def _read_min_confidence() -> float:
@@ -66,8 +66,6 @@ MAX_APP_NGRAM_WORDS = 4
 MAX_APP_OPTIONS = 200
 MAX_TEXT_OPTIONS = MAX_CHOICE_OPTIONS - 1
 MAX_RECENT_ACTIONS = 8
-MAX_DONE_LABELS = 5
-MIN_GOAL_TOKEN_CHARS = 3
 WAIT_MS = 1500
 TOOL_CALL_ID_PREFIX = "jev_"
 TOOL_CALL_ID_HEX_CHARS = 12
@@ -161,7 +159,6 @@ QUOTED_PATTERNS = (
     re.compile(r"“([^”\n]+?)”"),
 )
 SUFFIX_PATTERN = re.compile(r"^[^\W\d_]+$")
-WORD_PATTERN = re.compile(r"\w+")
 
 
 @dataclass(frozen=True)
@@ -517,33 +514,6 @@ def _goal_achieved(result: JevResult) -> float | None:
     return answer.value if isinstance(answer, JevNoul) else None
 
 
-def _goal_tokens(goal: str) -> set[str]:
-    return {
-        token
-        for token in WORD_PATTERN.findall(goal.casefold())
-        if len(token) >= MIN_GOAL_TOKEN_CHARS
-    }
-
-
-def _relevant_labels(ctx: PolicyContext) -> list[str]:
-    tokens = _goal_tokens(ctx.goal)
-    relevant = [
-        e.display
-        for e in ctx.elements
-        if tokens.intersection(WORD_PATTERN.findall(e.label.casefold()))
-    ]
-    return relevant[:MAX_DONE_LABELS]
-
-
-def _done_explanation(ctx: PolicyContext, goal_achieved: float) -> str:
-    labels = _relevant_labels(ctx)
-    visible = "; ".join(labels) if labels else "no goal keywords matched on screen"
-    return (
-        f"Jev judged every goal requirement satisfied on the current screen"
-        f" (goal_achieved={goal_achieved:.2f}). Relevant visible elements: {visible}."
-    )
-
-
 @dataclass(frozen=True)
 class _Target:
     key: str | None
@@ -587,7 +557,7 @@ def _resolve_target(result: JevResult, ctx: PolicyContext, op: str) -> _Target |
     )
 
 
-def _build_tool_call(op: str, target: _Target, explanation: str) -> dict[str, Any] | None:
+def _build_tool_call(op: str, target: _Target) -> dict[str, Any] | None:
     if op == OP_TAP:
         return _tool_call(
             "click", {"target": int(str(target.key)), "target_description": target.label}
@@ -610,8 +580,6 @@ def _build_tool_call(op: str, target: _Target, explanation: str) -> dict[str, An
         return _tool_call("wait_for_delay", {"time_in_ms": WAIT_MS})
     if op == OP_OPEN_APP:
         return _tool_call("manage_app", {"action": "launch", "app_name": target.key})
-    if op == OP_DONE:
-        return _tool_call("report_task_status", {"status": "completed", "explanation": explanation})
     return None
 
 
@@ -642,8 +610,7 @@ def interpret(result: JevResult, ctx: PolicyContext) -> JevVerdict:
     rejection = _rejection(verdict, ctx)
     if rejection is not None:
         return replace(verdict, rejection=rejection)
-    explanation = _done_explanation(ctx, goal_achieved or 0.0)
-    tool_call = _build_tool_call(op, target, explanation)
+    tool_call = _build_tool_call(op, target)
     if tool_call is None:
         return replace(verdict, rejection=f"unsupported operation {op}")
     return replace(verdict, tool_call=tool_call)
@@ -661,8 +628,8 @@ def _rejection(verdict: JevVerdict, ctx: PolicyContext) -> str | None:
         and verdict.confidence < RISKY_MIN_CONFIDENCE
     ):
         return f"risky target needs confidence >= {RISKY_MIN_CONFIDENCE:.2f}"
-    if verdict.operation == OP_DONE and (verdict.goal_achieved or 0.0) < DONE_MIN:
-        return f"goal_achieved {verdict.goal_achieved} < {DONE_MIN:.2f}"
+    if verdict.operation == OP_DONE:
+        return DONE_DEFERRED_REASON
     if ctx.is_excluded(verdict.signature):
         return "action excluded on this screen"
     return None
