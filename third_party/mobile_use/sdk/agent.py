@@ -97,6 +97,22 @@ from third_party.mobile_use.utils.media import (
 
 logger = get_logger(__name__)
 
+FLASH_PROFILE_NAME = "flash"
+JEV_PROFILE_NAME = "jev"
+BUILTIN_PROFILE_NAMES = (FLASH_PROFILE_NAME, JEV_PROFILE_NAME, "pro", "ultra", "default")
+
+
+def select_reactive_runner_class(profile: str | None) -> type[FlashRunner] | None:
+    profile_name = (profile or "").lower()
+    if profile_name == JEV_PROFILE_NAME:
+        from artemis.agents.jev.runner import JevRunner
+
+        return JevRunner
+    if profile_name == FLASH_PROFILE_NAME:
+        return FlashRunner
+    return None
+
+
 TOutput = TypeVar("TOutput", bound=BaseModel | None)
 
 
@@ -400,12 +416,7 @@ class AgentBase:
         if request.profile:
             agent_profile = self._config.agent_profiles.get(request.profile)
             if agent_profile is None:
-                if request.profile.lower() in (
-                    "flash",
-                    "pro",
-                    "ultra",
-                    "default",
-                ):
+                if request.profile.lower() in BUILTIN_PROFILE_NAMES:
                     agent_profile = self._config.default_profile
                 else:
                     raise AgentProfileNotFoundError(request.profile)
@@ -558,11 +569,13 @@ class AgentBase:
                         "environment_ready", "Device environment is ready", session_id=str(sess_id)
                     )
                     try:
-                        if request.profile and request.profile.lower() == "flash":
-                            logger.info(f"[{task_name}] Invoking FlashRunner reactive loop...")
+                        runner_class = select_reactive_runner_class(request.profile)
+                        if runner_class is not None:
+                            runner_name = runner_class.__name__
+                            logger.info(f"[{task_name}] Invoking {runner_name} reactive loop...")
                             await task.set_status(
                                 status="running",
-                                message="Invoking FlashRunner...",
+                                message=f"Invoking {runner_name}...",
                             )
 
                             # An explicit max_steps caps the reactive loop; the
@@ -571,7 +584,7 @@ class AgentBase:
                             max_turns = (
                                 request.max_steps if request.max_steps != RECURSION_LIMIT else None
                             )
-                            runner = FlashRunner(context, goal=request.goal, max_turns=max_turns)
+                            runner = runner_class(context, goal=request.goal, max_turns=max_turns)
                             flash_result = await runner.run(state)
 
                             output = flash_result
@@ -585,7 +598,7 @@ class AgentBase:
                                     context.data_engine.end_session("completed")
                             else:
                                 err = (
-                                    f"[{task_name}] FlashRunner failed:"
+                                    f"[{task_name}] {runner_name} failed:"
                                     f" {flash_result.get('explanation')}"
                                 )
                                 logger.warning(err)

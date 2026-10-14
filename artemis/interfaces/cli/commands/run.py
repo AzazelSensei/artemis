@@ -173,7 +173,10 @@ def run_command(
         typer.Option(
             "--profile",
             "-p",
-            help="Execution profile ('flash' for fast reactive, 'pro' for full graph).",
+            help=(
+                "Execution profile ('flash' for fast reactive, 'jev' for Jev fast decisions"
+                " with Claude fallback (requires TYPESAFE_API_KEY), 'pro' for full graph)."
+            ),
         ),
     ] = "pro",
     locked_app_package: Annotated[
