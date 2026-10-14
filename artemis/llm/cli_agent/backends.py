@@ -122,6 +122,14 @@ _CODEX_IO_RE = re.compile(
 _HELP_CACHE: dict[tuple[str, ...], bool] = {}
 
 logger = logging.getLogger(__name__)
+_GROK_HOME_KEY = "GROK_HOME"
+_ARTEMIS_GROK_HOME_ENV = "ARTEMIS_GROK_HOME"
+_GROK_HOME_DISABLED_VALUES = frozenset({"0", "off", "false", "none"})
+_GROK_AUTH_FILE_NAME = "auth.json"
+_GROK_DEFAULT_HOME = Path.home() / ".grok"
+_GROK_ISOLATED_HOME = Path.home() / "Library" / "Caches" / "artemis" / "grok-home"
+_GROK_HOME_DIR_MODE = 0o700
+_GROK_LINK_ATTEMPTS = 3
 
 
 def create_backend(provider: str) -> CliBackend:
@@ -263,6 +271,9 @@ class GrokBackend:
         _require_timeout(request.timeout_seconds)
         binary = _resolve_bin(_GROK_BIN_ENV, "grok")
         env = _quiet_env(_GROK_DROPPED_KEYS, _GROK_QUIET_ENV)
+        isolated_home = _grok_isolated_home(env)
+        if isolated_home is not None:
+            env[_GROK_HOME_KEY] = str(isolated_home)
         argv = [
             binary,
             *_grok_input_args(request, workdir),
@@ -284,7 +295,70 @@ class GrokBackend:
             request.timeout_seconds,
             env=env,
         )
+        if isolated_home is not None:
+            _check_grok_auth_link(isolated_home)
         return _json_cli_response(stdout)
+
+
+def _grok_isolated_home(env: dict[str, str]) -> Path | None:
+    raw = os.environ.get(_ARTEMIS_GROK_HOME_ENV, "").strip()
+    if raw.lower() in _GROK_HOME_DISABLED_VALUES:
+        return None
+    home = Path(raw).expanduser() if raw else _GROK_ISOLATED_HOME
+    real_home = Path(env.get(_GROK_HOME_KEY) or _GROK_DEFAULT_HOME).expanduser()
+    source = real_home / _GROK_AUTH_FILE_NAME
+    if str(home.resolve()).casefold() == str(real_home.resolve()).casefold():
+        return None
+    if not source.is_file():
+        logger.warning("grok auth file not found at %s; using the default grok home", source)
+        return None
+    link = home / _GROK_AUTH_FILE_NAME
+    try:
+        if not home.exists():
+            home.mkdir(parents=True, mode=_GROK_HOME_DIR_MODE, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cannot prepare isolated grok home %s: %s", home, exc)
+        return None
+    for _attempt in range(_GROK_LINK_ATTEMPTS):
+        if _is_link_to(link, source):
+            return home
+        if link.exists() and not link.is_symlink():
+            logger.warning(
+                "isolated grok auth file %s is not a symlink; using the default grok home", link
+            )
+            return None
+        try:
+            if link.is_symlink():
+                link.unlink(missing_ok=True)
+            link.symlink_to(source)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            logger.warning("cannot prepare isolated grok home %s: %s", home, exc)
+            return None
+    if _is_link_to(link, source):
+        return home
+    logger.warning("isolated grok auth link %s is not ready; using the default grok home", link)
+    return None
+
+
+def _is_link_to(link: Path, source: Path) -> bool:
+    try:
+        return link.is_symlink() and Path(os.readlink(link)) == source
+    except OSError:
+        return False
+
+
+def _check_grok_auth_link(home: Path) -> None:
+    link = home / _GROK_AUTH_FILE_NAME
+    if link.is_symlink():
+        return
+    logger.error(
+        "grok replaced the isolated auth symlink at %s; set %s=off and sign in again if grok"
+        " reports an expired session",
+        link,
+        _ARTEMIS_GROK_HOME_ENV,
+    )
 
 
 def _grok_input_args(request: CliRequest, workdir: Path) -> list[str]:
