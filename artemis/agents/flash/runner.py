@@ -43,16 +43,19 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
+import time
 import uuid
 
 from jinja2 import Template
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
 
+from artemis.agents.flash.decision import PreTurnDecision
 from artemis.agents.flash.summarizer import VisualStepSummarizer, build_focus_context
 from artemis.agents.operator.prompts import REASONING_REMINDER, UserGuidance, render_user_guidance
 from artemis.agents.validator.tool_declarations import (
@@ -104,6 +107,9 @@ _NO_TOOL_CALL_NOTICE = (
 )
 
 _FINAL_TURN_WARNING = "[WARNING] This is your final turn; only 'report_task_status' is available."
+
+_ZERO_TOKEN_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+_PRE_TURN_DECISION_TIMEOUT_S = 15.0
 
 
 @dataclass
@@ -893,6 +899,54 @@ class FlashRunner:
             acomplete(bound_llm, messages), timeout_seconds=10, hard_timeout=180
         )
 
+    async def _pre_turn_decision(
+        self, state: State, turn: int, xml_list: str
+    ) -> PreTurnDecision | None:
+        return None
+
+    async def _run_pre_turn_decision(
+        self, state: State, turn: int, xml_list: str
+    ) -> AIMessage | None:
+        started = time.monotonic()
+        try:
+            decision = await asyncio.wait_for(
+                self._pre_turn_decision(state, turn, xml_list),
+                timeout=_PRE_TURN_DECISION_TIMEOUT_S,
+            )
+            response = self._decision_to_response(decision)
+        except Exception as exc:
+            logger.warning(
+                f"Pre-turn decision failed at turn {turn} in"
+                f" {time.monotonic() - started:.2f}s; falling back to the model: {exc!r}"
+            )
+            return None
+        elapsed = time.monotonic() - started
+        if response is None:
+            logger.info(f"Pre-turn decision empty at turn {turn} in {elapsed:.2f}s")
+            return None
+        logger.info(
+            f"Pre-turn decision taken at turn {turn} in {elapsed:.2f}s:"
+            f" {[tc['name'] for tc in response.tool_calls]} ({decision.reason[:100]})"
+        )
+        return response
+
+    @staticmethod
+    def _decision_to_response(decision: PreTurnDecision | None) -> AIMessage | None:
+        if not isinstance(decision, PreTurnDecision) or not decision.tool_calls:
+            return None
+        return AIMessage(
+            content=decision.reason,
+            tool_calls=[
+                {
+                    "name": tc["name"],
+                    "args": tc.get("args") or {},
+                    "id": tc.get("id") or str(uuid.uuid4()),
+                    "type": "tool_call",
+                }
+                for tc in decision.tool_calls
+            ],
+        )
+
     async def _process_tool_calls(
         self,
         tool_calls: list,
@@ -1095,7 +1149,15 @@ class FlashRunner:
             turn_base = len(messages) - 1
             current_tools = report_only_tools if is_final else tools_declaration
 
-            response = await self._invoke_model(llm, current_tools, messages)
+            decided = (
+                None
+                if is_final
+                else await self._run_pre_turn_decision(state, turns, current_xml_list)
+            )
+            if decided is not None:
+                response = decided
+            else:
+                response = await self._invoke_model(llm, current_tools, messages)
 
             if response is None:
                 break
@@ -1104,22 +1166,27 @@ class FlashRunner:
 
             # Extract thought and tool calls
             raw_text = self._extract_response_text(response)
-            native_text = self._extract_response_thinking(response)
 
-            # Extract token usage metadata from response
-            step_token_usage, measured = self._resolve_token_usage(response, messages, raw_text)
-            # The ledger's compaction thresholds read the runner's own prompt
-            # size, never the session-wide meter (which any agent overwrites).
-            # The prompt as sent (``messages`` minus the just-appended reply)
-            # rides along so the ledger can calibrate its chars-per-token
-            # ratio — only from a provider measurement, never from the
-            # estimate (same as the Pro operator).
-            ledger.record_prompt_tokens(
-                step_token_usage.get("prompt_tokens"),
-                messages=messages[:-1] if measured else None,
-            )
+            if decided is not None:
+                native_text = None
+                step_token_usage = dict(_ZERO_TOKEN_USAGE)
+            else:
+                native_text = self._extract_response_thinking(response)
 
-            self._record_llm_trace(step_token_usage, raw_text)
+                # Extract token usage metadata from response
+                step_token_usage, measured = self._resolve_token_usage(response, messages, raw_text)
+                # The ledger's compaction thresholds read the runner's own prompt
+                # size, never the session-wide meter (which any agent overwrites).
+                # The prompt as sent (``messages`` minus the just-appended reply)
+                # rides along so the ledger can calibrate its chars-per-token
+                # ratio — only from a provider measurement, never from the
+                # estimate (same as the Pro operator).
+                ledger.record_prompt_tokens(
+                    step_token_usage.get("prompt_tokens"),
+                    messages=messages[:-1] if measured else None,
+                )
+
+                self._record_llm_trace(step_token_usage, raw_text)
 
             tool_calls = self._resolve_tool_calls(response, raw_text)
 
