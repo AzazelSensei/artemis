@@ -40,6 +40,7 @@ from artemis.config import (
     get_default_llm_config,
     settings,
 )
+from artemis.config.llm import preset_default_llm
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import CURRENT_TRACE_ID, DataEngineCallbackHandler
 from artemis.llm.google import is_google_chat_model, is_google_provider
@@ -880,6 +881,17 @@ def get_google_llm(
     include_thoughts: bool | None = None,
     enable_grounding: bool = False,
 ) -> BaseChatModel:
+    preset = preset_default_llm()
+    if preset is not None:
+        return ModelFactory.create_model(
+            ModelEndpoint(
+                provider=ModelProvider.from_string(preset.provider),
+                model_name=preset.model,
+                temperature=temperature or 0.0,
+                timeout_seconds=preset.timeout or timeout or 60.0,
+                reasoning_effort=preset.reasoning_effort,
+            )
+        )
     ep = ModelEndpoint(
         provider=ModelProvider.GOOGLE,
         model_name=model_name,

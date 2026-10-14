@@ -45,6 +45,31 @@
       "provider": "openai",
       "model": "llama3.2-vision",
       "fallback": { "provider": "openai", "model": "llama3.2-vision" }
+    },
+    "claude-code": {
+      "provider": "claude_code",
+      "model": "claude-haiku-5-5",
+      "reasoning_effort": "medium",
+      "timeout": 90,
+      "fallback": { "provider": "codex_cli", "model": "gpt-6-luna" }
+    },
+    "codex-cli": {
+      "provider": "codex_cli",
+      "model": "gpt-6-luna",
+      "timeout": 120,
+      "fallback": { "provider": "claude_code", "model": "claude-haiku-5-5", "reasoning_effort": "medium" }
+    },
+    "cursor-grok": {
+      "provider": "cursor_cli",
+      "model": "grok-4.7-low-fast",
+      "timeout": 180,
+      "fallback": { "provider": "claude_code", "model": "claude-haiku-5-5", "reasoning_effort": "medium" }
+    },
+    "grok-cli": {
+      "provider": "grok_cli",
+      "model": "grok-4.7-build",
+      "timeout": 180,
+      "fallback": { "provider": "claude_code", "model": "claude-haiku-5-5", "reasoning_effort": "medium" }
     }
   },
 

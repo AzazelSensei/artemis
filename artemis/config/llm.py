@@ -14,12 +14,14 @@
 
 """LLM provider, model hierarchy, fallback chaining, and configuration loaders."""
 
+import os
 from pathlib import Path
 from typing import Any
 
 
 from artemis.config.constants import (
     LLM_CONFIG_FILENAME,
+    LLM_PRESET_ENV,
     AgentNode,
 )
 from artemis.config.paths import ROOT_DIR, get_config_path
@@ -51,6 +53,7 @@ __all__ = [
     "get_default_llm_config",
     "initialize_llm_config",
     "lightweight_judge_default",
+    "preset_default_llm",
     "load_llm_config_override",
     "parse_llm_config",
     "validate_vertex_ai_credentials",
@@ -124,7 +127,7 @@ class LLMConfig(LLMConfigBase):
                 # Both are cheap, high-frequency judges: the pixel safety net
                 # runs before actions, the planner validator after every
                 # milestone edit. They share one lightweight default.
-                return lightweight_judge_default()
+                return preset_default_llm() or lightweight_judge_default()
             elif item == "output_analyzer":
                 return self.log_analyzer
         return val
@@ -197,6 +200,24 @@ def _expand_default_into_nodes(config_dict: dict) -> dict:
     return result
 
 
+def _apply_env_preset(config_dict: dict) -> dict:
+    preset_name = os.environ.get(LLM_PRESET_ENV, "").strip()
+    if not preset_name:
+        return config_dict
+    presets = config_dict.get("presets", {})
+    if preset_name not in presets:
+        raise ValueError(
+            f"{LLM_PRESET_ENV}={preset_name} not found; available presets: {sorted(presets)}"
+        )
+    return {**config_dict, "default": presets[preset_name], "nodes": {}}
+
+
+def preset_default_llm() -> LLMWithFallback | None:
+    if not os.environ.get(LLM_PRESET_ENV, "").strip():
+        return None
+    return parse_llm_config().planner
+
+
 def parse_llm_config() -> LLMConfig:
     """Parse and instantiate LLMConfig from artemis.jsonc or llm-config.json."""
     config_path = None
@@ -212,7 +233,7 @@ def parse_llm_config() -> LLMConfig:
 
     try:
         with open(config_path, encoding="utf-8") as f:
-            config_dict = load_jsonc(f)
+            config_dict = _apply_env_preset(load_jsonc(f))
             expanded_dict = _expand_default_into_nodes(config_dict)
             return LLMConfig.model_validate(expanded_dict)
     except Exception as e:

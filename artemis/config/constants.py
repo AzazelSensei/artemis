@@ -119,8 +119,21 @@ DEFAULT_EXPLORER_VERSION: Literal["flash", "pro", "ultra"] = "flash"
 # ==============================================================================
 
 LLMProvider = Literal[
-    "openai", "google", "openrouter", "xai", "vertexai", "anthropic", "ollama", "vllm", "custom"
+    "openai",
+    "google",
+    "openrouter",
+    "xai",
+    "vertexai",
+    "anthropic",
+    "ollama",
+    "vllm",
+    "custom",
+    "claude_code",
+    "codex_cli",
+    "cursor_cli",
+    "grok_cli",
 ]
+LLM_PRESET_ENV = "ARTEMIS_LLM_PRESET"
 ExplorerVersion = Literal["flash", "pro", "ultra"]
 
 LLMUtilsNode = Literal[

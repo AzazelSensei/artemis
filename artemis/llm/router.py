@@ -16,7 +16,7 @@
 
 Provides role-based LLM/VLM dispatching, dynamic fallback chains,
 and unified provider configuration across Gemini, Vertex AI, OpenAI,
-Anthropic, OpenRouter, and local Ollama/vLLM endpoints.
+Anthropic, OpenRouter, local Ollama/vLLM, and subscription CLI agents.
 """
 
 from enum import StrEnum
@@ -45,6 +45,10 @@ class ModelProvider(StrEnum):
     OLLAMA = "ollama"
     VLLM = "vllm"
     CUSTOM = "custom"
+    CLAUDE_CODE = "claude_code"
+    CODEX_CLI = "codex_cli"
+    CURSOR_CLI = "cursor_cli"
+    GROK_CLI = "grok_cli"
 
     @classmethod
     def from_string(cls, val: Any) -> "ModelProvider":
@@ -75,6 +79,12 @@ class ModelProvider(StrEnum):
             "ollama": cls.OLLAMA,
             "vllm": cls.VLLM,
             "custom": cls.CUSTOM,
+            "claudecode": cls.CLAUDE_CODE,
+            "codex": cls.CODEX_CLI,
+            "codexcli": cls.CODEX_CLI,
+            "cursor": cls.CURSOR_CLI,
+            "cursorcli": cls.CURSOR_CLI,
+            "grokcli": cls.GROK_CLI,
         }
         provider = mapping.get(s)
         if provider is None:
@@ -82,6 +92,28 @@ class ModelProvider(StrEnum):
                 f"Unknown LLM provider {val!r}. Valid providers: {sorted(set(mapping))}"
             )
         return provider
+
+
+_CLI_TIMEOUT_CLAUDE_CODE_SECONDS = 90.0
+_CLI_TIMEOUT_CODEX_CLI_SECONDS = 120.0
+_CLI_TIMEOUT_CURSOR_CLI_SECONDS = 180.0
+_CLI_TIMEOUT_GROK_CLI_SECONDS = 180.0
+
+_CLI_AGENT_PROVIDERS = frozenset(
+    {
+        ModelProvider.CLAUDE_CODE,
+        ModelProvider.CODEX_CLI,
+        ModelProvider.CURSOR_CLI,
+        ModelProvider.GROK_CLI,
+    }
+)
+
+_CLI_TIMEOUT_SECONDS = {
+    ModelProvider.CLAUDE_CODE: _CLI_TIMEOUT_CLAUDE_CODE_SECONDS,
+    ModelProvider.CODEX_CLI: _CLI_TIMEOUT_CODEX_CLI_SECONDS,
+    ModelProvider.CURSOR_CLI: _CLI_TIMEOUT_CURSOR_CLI_SECONDS,
+    ModelProvider.GROK_CLI: _CLI_TIMEOUT_GROK_CLI_SECONDS,
+}
 
 
 class ModelEndpoint(BaseModel):
@@ -384,6 +416,17 @@ class ModelFactory:
             if endpoint.reasoning_effort:
                 kwargs["reasoning_effort"] = endpoint.reasoning_effort
             return ChatOpenAI(**{k: v for k, v in kwargs.items() if v is not None})
+
+        elif provider in _CLI_AGENT_PROVIDERS:
+            from artemis.llm.cli_agent.backends import create_backend
+            from artemis.llm.cli_agent.model import CliChatModel
+
+            return CliChatModel(
+                backend=create_backend(provider.value),
+                model_name=endpoint.model_name or None,
+                effort=endpoint.reasoning_effort,
+                timeout_seconds=endpoint.timeout_seconds or _CLI_TIMEOUT_SECONDS[provider],
+            )
 
         else:
             raise ValueError(f"Unsupported model provider: {provider}")
