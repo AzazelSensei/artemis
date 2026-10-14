@@ -91,7 +91,26 @@ RULE_OPTIONAL = "Calling tools is optional."
 RULE_NONE = "tool_calls must be empty."
 RULE_NAMED_PREFIX = 'You must call the tool "'
 RULE_NAMED_SUFFIX = '".'
-TOOLS_HEADING = "Tools:"
+RULE_NO_DIRECT_CALLS = (
+    "Never invoke any action listed below as a native tool or function call; "
+    "such a call fails. Wherever these instructions say to call a tool or an action, "
+    "it means adding an entry to the envelope's tool_calls array."
+)
+RULE_STRUCTURED_OUTPUT = (
+    "If a StructuredOutput tool is offered, it is the only tool you may call: "
+    "your whole reply is exactly one StructuredOutput call carrying the complete envelope, "
+    "with no text before or after it. "
+    "Otherwise reply with the envelope as JSON text."
+)
+RULE_PROSE_IN_CONTENT = (
+    "Any prose these instructions ask you to write (observations, reasoning, plans, "
+    "milestones, notes) goes only into the envelope's content field; "
+    "write no text outside the envelope."
+)
+TOOLS_HEADING = (
+    "Available actions (these are NOT callable tools; "
+    "use them only as the name field inside the JSON envelope):"
+)
 Piece = str | ImageSegment
 
 
@@ -142,6 +161,9 @@ def render_tool_instructions(tools: list[dict], tool_choice: Any) -> str:
         RULE_ENVELOPE_SHAPE,
         RULE_TOOL_CALL_SHAPE,
         RULE_MULTIPLE_CALLS,
+        RULE_NO_DIRECT_CALLS,
+        RULE_STRUCTURED_OUTPUT,
+        RULE_PROSE_IN_CONTENT,
         "",
         TOOLS_HEADING,
     ]
