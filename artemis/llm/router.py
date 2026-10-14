@@ -114,6 +114,15 @@ _CLI_TIMEOUT_SECONDS = {
     ModelProvider.CURSOR_CLI: _CLI_TIMEOUT_CURSOR_CLI_SECONDS,
     ModelProvider.GROK_CLI: _CLI_TIMEOUT_GROK_CLI_SECONDS,
 }
+_CLI_KEEP_LAST_IMAGES_ENV = "ARTEMIS_CLI_KEEP_LAST_IMAGES"
+_CLI_KEEP_LAST_IMAGES_DEFAULT = 2
+
+
+def _read_cli_keep_last_images() -> int:
+    raw = os.environ.get(_CLI_KEEP_LAST_IMAGES_ENV, "").strip()
+    if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
+        return _CLI_KEEP_LAST_IMAGES_DEFAULT
+    return int(raw)
 
 
 class ModelEndpoint(BaseModel):
@@ -426,6 +435,7 @@ class ModelFactory:
                 model_name=endpoint.model_name or None,
                 effort=endpoint.reasoning_effort,
                 timeout_seconds=endpoint.timeout_seconds or _CLI_TIMEOUT_SECONDS[provider],
+                keep_last_images=_read_cli_keep_last_images(),
             )
 
         else:

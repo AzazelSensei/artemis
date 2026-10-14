@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import base64
+import io
+import logging
+import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +30,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from PIL import Image
 from pydantic import ConfigDict
 
 from artemis.llm.cli_agent.messages import (
@@ -51,6 +56,17 @@ CHOICE_AUTO = "auto"
 CHOICE_NONE = "none"
 AT_LEAST_ONE_CHOICES = frozenset({CHOICE_ANY, CHOICE_REQUIRED})
 NON_NAME_CHOICES = frozenset({CHOICE_ANY, CHOICE_REQUIRED, CHOICE_AUTO, CHOICE_NONE})
+CLI_IMAGE_MAX_WIDTH = 720
+CLI_IMAGE_JPEG_QUALITY = 80
+CLI_IMAGE_MAX_WIDTH_ENV = "ARTEMIS_CLI_IMAGE_MAX_WIDTH"
+JPEG_MEDIA_TYPE = "image/jpeg"
+JPEG_MEDIA_TYPES = frozenset({JPEG_MEDIA_TYPE, "image/jpg"})
+JPEG_FORMAT = "JPEG"
+JPEG_SUFFIX = ".jpg"
+SHRUNK_IMAGE_STEM_SUFFIX = "_cli"
+RGB_MODE = "RGB"
+
+logger = logging.getLogger(__name__)
 
 
 class CliChatModel(BaseChatModel):
@@ -84,6 +100,7 @@ class CliChatModel(BaseChatModel):
             workdir = Path(directory)
             system_prompt, segments = build_request_parts(messages, workdir)
             segments = _limit_images(segments, self.keep_last_images)
+            segments = await asyncio.to_thread(_shrink_images, segments, workdir)
             json_schema = None
             names: list[str] = []
             if tools:
@@ -249,3 +266,57 @@ def _join_text(left: str, right: str) -> str:
     if left.endswith("\n") or right.startswith("\n"):
         return left + right
     return left + "\n" + right
+
+
+def _image_max_width() -> int:
+    raw = os.environ.get(CLI_IMAGE_MAX_WIDTH_ENV)
+    if raw is None or not raw.strip():
+        return CLI_IMAGE_MAX_WIDTH
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid %s=%r, using default %d", CLI_IMAGE_MAX_WIDTH_ENV, raw, CLI_IMAGE_MAX_WIDTH
+        )
+        return CLI_IMAGE_MAX_WIDTH
+
+
+def _shrink_images(segments: list[Segment], workdir: Path) -> list[Segment]:
+    max_width = _image_max_width()
+    if max_width <= 0:
+        return segments
+    return [
+        _shrink_image(segment, workdir, max_width) if isinstance(segment, ImageSegment) else segment
+        for segment in segments
+    ]
+
+
+def _shrink_image(segment: ImageSegment, workdir: Path, max_width: int) -> ImageSegment:
+    try:
+        return _encode_shrunk_image(segment, workdir, max_width)
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        logger.warning("keeping original screenshot %s: %s", segment.path.name, error)
+        return segment
+
+
+def _encode_shrunk_image(segment: ImageSegment, workdir: Path, max_width: int) -> ImageSegment:
+    with Image.open(segment.path) as image:
+        is_jpeg = segment.media_type in JPEG_MEDIA_TYPES and image.format == JPEG_FORMAT
+        if is_jpeg and image.width <= max_width:
+            return segment
+        converted = image.convert(RGB_MODE) if image.mode != RGB_MODE else image.copy()
+    if converted.width > max_width:
+        height = max(1, round(converted.height * max_width / converted.width))
+        converted = converted.resize((max_width, height), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    converted.save(buffer, format=JPEG_FORMAT, quality=CLI_IMAGE_JPEG_QUALITY, optimize=True)
+    payload = buffer.getvalue()
+    path = workdir / f"{segment.path.stem}{SHRUNK_IMAGE_STEM_SUFFIX}{JPEG_SUFFIX}"
+    path.write_bytes(payload)
+    if segment.path != path:
+        segment.path.unlink(missing_ok=True)
+    return ImageSegment(
+        path=path,
+        media_type=JPEG_MEDIA_TYPE,
+        base64_data=base64.b64encode(payload).decode("ascii"),
+    )
